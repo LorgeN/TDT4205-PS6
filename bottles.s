@@ -10,10 +10,8 @@
 
 .section .text
 main:
+	pushq %r12
 	movq $10, %r12
-
-	pushq %rbp
-	movq %rsp, %rbp
 
 main_wprint:
 	movq $.STR0, %rdi
@@ -36,8 +34,8 @@ main_wprint:
 	cmp $0, %r12
 	jg main_wprint
 
+	popq %r12
 	movq $0, %rax
 
-	leave
 	ret
  
