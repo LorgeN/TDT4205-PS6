@@ -264,10 +264,10 @@ void __call_function(node_t *node, symbol_t *calling_function, unsigned int *sta
     }
 
     /*
-    This compiler does not utilize any caller-saved registers in generation,
-    so we do not technically need to save them.
-
-    TODO: Save them anyway
+    This compiler does not utilize the caller-saved registers in a way 
+    that requires us to save them here, that is to say that any value
+    that isn't immediately used is pushed to the stack anyway (this mainly
+    applies to expressions)
     */
 
     unsigned int required_stack_space = MAX(6, func->nparms) - 6;
