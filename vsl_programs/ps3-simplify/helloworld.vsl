@@ -1,0 +1,6 @@
+func helloworld() begin
+    var a
+    a := 0
+    print "Hello, World!", a + 2
+    return 0
+end

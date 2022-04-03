@@ -1,0 +1,21 @@
+
+func my_func(a, b, c, d, e, f, g, h) begin
+    var i, j, k, l, m
+
+    i := a + b + d
+
+    print "hmmm"
+    
+    return i
+end
+
+func main() begin
+    var n, o, p, q, r, s, t, u, v, w
+
+    n := 5
+    n += my_func(1, 2, 3, 5, 8, 13, 21, 34)
+
+    print n
+
+    return 0
+end
