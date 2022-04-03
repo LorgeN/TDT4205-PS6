@@ -1,24 +1,40 @@
 #include <stdbool.h>
 #include <vslc.h>
 
+// Struct containing data for the current target/goal/objective
+// of the compiler
+struct compilation_target_t {
+    // The node we are working on
+    node_t *node;
+    // The function the node is contained within
+    symbol_t *function;
+    // The current stack alignment, i.e. how many bytes we've pushed
+    // on the stack at this point
+    unsigned int *stack_alignment;
+    // If a return statement has been added
+    bool *returned;
+    // The target destination of the value of this node, such as a
+    // register or memory address
+    char *target_destination;
+};
+
 /**Generate table of strings in a rodata section. */
-void generate_stringtable(void);
+static void generate_stringtable(void);
 /**Declare global variables in a bss section */
-void generate_global_variables(size_t n_globals, symbol_t **global_list);
+static void generate_global_variables(size_t n_globals, symbol_t **global_list);
 /**Declare global variables in a bss section */
-void generate_functions(symbol_t **main, size_t n_globals, symbol_t **global_list);
+static void generate_functions(symbol_t **main, size_t n_globals, symbol_t **global_list);
 /**Generate function entry code
  * @param function symbol table entry of function */
-void generate_function(symbol_t *function);
-/**Generate code for a node in the AST, to be called recursively from
- * generate_function
- * @param node root node of current code block */
-static void generate_node(node_t *node, symbol_t *function, unsigned int *stack_alignment, bool *returned);
+static void generate_function(symbol_t *function);
+static void generate_node(struct compilation_target_t target);
 /**Initializes program (already implemented) */
-void generate_main(symbol_t *first);
+static void generate_main(symbol_t *first);
 
+// Prefix for all functions that are compiled
 #define FUNC_PREFIX "_func_"
 
+// Macros that avoid evaluating twice
 #define MIN(a, b) \
     ({ __typeof__ (a) _a = (a); \
        __typeof__ (b) _b = (b); \
@@ -33,12 +49,6 @@ static const char *PARAMETER_REGISTERS[6] = {
     "%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"};
 
 void generate_program(void) {
-    /* TODO: Emit assembly instructions for functions, function calls,
-     * print statements and expressions.
-     * The provided function 'generate_main' creates a program entry point
-     * for the function symbol it is given as argument.
-     */
-
     symbol_t *main;
 
     generate_stringtable();
@@ -121,7 +131,6 @@ unsigned int __allocate_aligned_stack(size_t slots, unsigned int *stack_alignmen
         return 0;
     }
 
-    printf("\t# Stack allocation for %u slots with alignment of %u\n", slots, offset);
     printf("\tsubq $%d, %%rsp\n", slots * 8 + offset);
     return offset;
 }
@@ -132,7 +141,6 @@ void __allocate_stack(size_t slots, unsigned int *stack_alignment) {
     }
 
     *stack_alignment += slots * 8;
-    printf("\t# Stack allocation for %u slots (Stack offset %u)\n", slots, (*stack_alignment) % 16);
     printf("\tsubq $%d, %%rsp\n", slots * 8);
 }
 
@@ -144,14 +152,12 @@ unsigned int __align_stack(unsigned int *stack_alignment) {
 
     unsigned int offset = 16 - ((*stack_alignment) % 16);
     *stack_alignment += offset;
-    printf("\t# Stack with alignment of %u\n", offset);
     printf("\tsubq $%d, %%rsp\n", offset);
     return offset;
 }
 
 void __unalign_stack(unsigned int alignment, unsigned int *stack_alignment) {
     if (alignment != 0) {
-        printf("\t# Return stack to state before alignment");
         printf("\taddq $%d, %rsp\n", alignment);
         *stack_alignment -= alignment;
     }
@@ -174,8 +180,7 @@ void __move_global_to_reg(const char *reg, char *global) {
 }
 
 size_t __get_variable_count(symbol_t *function) {
-    size_t n_locals = tlhash_size(function->locals);
-    return n_locals - function->nparms;
+    return tlhash_size(function->locals) - function->nparms;
 }
 
 int __get_slot(symbol_t *function, symbol_t *sym) {
@@ -184,28 +189,6 @@ int __get_slot(symbol_t *function, symbol_t *sym) {
     }
 
     return sym->seq + MIN(6, function->nparms);
-}
-
-void __print_slots(symbol_t *function) {
-    size_t n_locals = tlhash_size(function->locals);
-    symbol_t **local_list = malloc(sizeof(symbol_t *) * n_locals);
-    tlhash_values(function->locals, (void **)local_list);
-
-    printf("Stack slots for function \"%s\"\n", function->name);
-
-    symbol_t *node;
-    for (size_t i = 0; i < n_locals; i++) {
-        node = local_list[i];
-        if (node->type == SYM_PARAMETER) {
-            printf("PARAM");
-        } else {
-            printf("VAR");
-        }
-
-        printf(": Seq %d - Slot %d\n", node->seq, __get_slot(function, node));
-    }
-
-    free(local_list);
 }
 
 void generate_function(symbol_t *function) {
@@ -224,8 +207,6 @@ void generate_function(symbol_t *function) {
     bool returned = false;
     __allocate_stack(paramc + __get_variable_count(function), &stack_alignment);
 
-    //__print_slots(function);
-
     // Move this in right to left order so that parameter 0
     // is at the top of the stack. This also means that our
     // parameters will be in order on the stack, with 0 at
@@ -236,11 +217,18 @@ void generate_function(symbol_t *function) {
 
     // All parameters are now on the stack
 
-    generate_node(function->node, function, &stack_alignment, &returned);
+    struct compilation_target_t target = {
+        .function = function,
+        .node = function->node,
+        .stack_alignment = &stack_alignment,
+        .target_destination = "%rax",
+        .returned = &returned};
+
+    generate_node(target);
 
     // This means there was no return statement
     if (!returned) {
-        puts("# Generated return statement");
+        puts("\t# Automatically generated return statement");
         puts("\tmovq $0, %rax");
         puts("\tleave");
         puts("\rret");
@@ -275,28 +263,40 @@ void __call_function(node_t *node, symbol_t *calling_function, unsigned int *sta
         exit(EXIT_FAILURE);
     }
 
+    /*
+    This compiler does not utilize any caller-saved registers in generation,
+    so we do not technically need to save them.
+
+    TODO: Save them anyway
+    */
+
     unsigned int required_stack_space = MAX(6, func->nparms) - 6;
     unsigned int alignment = __allocate_aligned_stack(required_stack_space, stack_alignment);
 
-    char access_buffer[32];
+    char access_buffer[32] = {0};
     node_t *arg;
     for (size_t param = 0; param < func->nparms; param++) {
         arg = argument_list->children[param];
-        // Illegal to return so we can leave it as NULL
-        generate_node(arg, calling_function, stack_alignment, NULL);
 
         __write_param_accessor(param, access_buffer, 32);
-        printf("\tmovq %%rax, %s\n", access_buffer);
+        struct compilation_target_t target = {
+            .function = calling_function,
+            .node = arg,
+            .stack_alignment = stack_alignment,
+            .returned = NULL,
+            .target_destination = access_buffer};
+
+        generate_node(target);
     }
 
     printf("\tcall %s%s\n", FUNC_PREFIX, func->name);
     __unalign_stack(alignment, stack_alignment);
 }
 
-void __generate_expression(node_t *node, symbol_t *function, unsigned int *stack_alignment) {
+void __generate_expression(struct compilation_target_t target) {
     // For all calls here we disallow the return statement so we can pass a null pointer
 
-    char *op = node->data;
+    char *op = target.node->data;
     if (op == NULL) {
         // This means that we have either
         // 1. Identifier
@@ -304,70 +304,90 @@ void __generate_expression(node_t *node, symbol_t *function, unsigned int *stack
         // 3. Function call
 
         // This is then a function call
-        if (node->n_children == 2) {
-            // This will put the result in %rax which is what we want
-            __call_function(node, function, stack_alignment);
+        if (target.node->n_children == 2) {
+            // This will put the result in %rax
+            __call_function(target.node, target.function, target.stack_alignment);
+
+            // Move if different
+            if (strcmp("%rax", target.target_destination)) {
+                printf("\tmovq %rax, %s\n", target.target_destination);
+            }
             return;
         }
 
         // We have support for generating these in generate_node so we
         // simply delegate it
-        generate_node(node->children[0], function, stack_alignment, NULL);
+        target.node = target.node->children[0];
+        generate_node(target);
         return;
     }
 
-    node_t *c1 = node->children[0];
+    node_t *c1 = target.node->children[0];
 
     // Unary operators
-    if (node->n_children == 1) {
-        generate_node(c1, function, stack_alignment, NULL);
+    if (target.node->n_children == 1) {
+        target.node = c1;
+        generate_node(target);
 
         switch (*op) {
             case '-':
-                puts("\tneg %rax");
+                printf("\tneg %s\n", target.target_destination);
                 break;
             case '~':
-                puts("\tnot %rax");
+                printf("\tnot %s\n", target.target_destination);
                 break;
         }
         return;
     }
 
-    node_t *c2 = node->children[1];
+    node_t *c2 = target.node->children[1];
 
-    generate_node(c2, function, stack_alignment, NULL);
-    puts("\tpushq %rax");
-    *stack_alignment += 8;
+    struct compilation_target_t child_target = {
+        .node = c2,
+        .function = target.function,
+        .stack_alignment = target.stack_alignment,
+        .returned = target.returned,
+        .target_destination = "%rax"};
 
-    generate_node(c1, function, stack_alignment, NULL);
+    generate_node(child_target);
+    puts("\tpushq %rax");  // Store temporary value
 
-    puts("\tpopq %r8");  // Random caller-saved register
-    *stack_alignment -= 8;
+    child_target.node = c1;
+
+    generate_node(child_target);
+    puts("\tpopq %r10");  // Retrieve previously calculated value
 
     // Now have lh side in rax and rh side in r8
 
     switch (*op) {
         case '|':
-            puts("\tor %r8, %rax");
+            puts("\tor %r10, %rax");
             break;
         case '^':
-            puts("\txor %r8, %rax");
+            puts("\txor %r10, %rax");
             break;
         case '&':
-            puts("\tand %r8, %rax");
+            puts("\tand %r10, %rax");
             break;
         case '+':
-            puts("\taddq %r8, %rax");
+            puts("\taddq %r10, %rax");
             break;
         case '-':
-            puts("\tsubq %r8, %rax");
+            puts("\tsubq %r10, %rax");
             break;
         case '*':
-            puts("\timulq %r8");
+            puts("\timulq %r10");
             break;
         case '/':
-            puts("\tidivq %r8");
+            puts("\tidivq %r10");
             break;
+    }
+
+    // A lot of the above ops do support giving them a memory address directly,
+    // but to keep the compiler a bit simpler (because some of them don't),
+    // we're doing it in a separate instruction
+    if (strncmp("%rax", target.target_destination, 4)) {
+        printf("\tmovq %rax, %s\n", target.target_destination);
     }
 }
 
@@ -401,124 +421,157 @@ void __write_variable(const char *reg, symbol_t *sym, symbol_t *function) {
     }
 }
 
-void generate_node(node_t *node, symbol_t *function, unsigned int *stack_alignment, bool *returned) {
+void __write_variable_accessor(char *buf, size_t bufsize, symbol_t *sym, symbol_t *function) {
+    switch (sym->type) {
+        case SYM_GLOBAL_VAR:
+            snprintf(buf, bufsize, ".%s", sym->name);
+            break;
+        case SYM_LOCAL_VAR:
+        case SYM_PARAMETER:
+            snprintf(buf, bufsize, "%d(%%rbp)", (__get_slot(function, sym) + 1) * -8);
+            break;
+        default:
+            fprintf(stderr, "Unsupported symbol type for identifier data \"%s\"\n", sym->name);
+            exit(EXIT_FAILURE);
+    }
+}
+
+void generate_node(struct compilation_target_t target) {
     node_t *identifier;
     node_t *expression;
-    switch (node->type) {
+
+    char buf[32] = {0};
+    struct compilation_target_t child_target = {
+        .function = target.function,
+        .returned = target.returned,
+        .stack_alignment = target.stack_alignment,
+    };
+
+    switch (target.node->type) {
         case EXPRESSION:
-            __generate_expression(node, function, stack_alignment);
+            __generate_expression(target);
             return;
         case IDENTIFIER_DATA:
             // This assumes the case where we want to access the value in the
             // referenced variable. Assignments are handled separately.
-            __access_variable("%rax", node->entry, function);
+            __access_variable(target.target_destination, target.node->entry, target.function);
             return;
         case NUMBER_DATA:
-            int64_t value = *((int64_t *)node->data);
-            printf("\tmovq $%ld, %%rax\n", value);
+            int64_t value = *((int64_t *)target.node->data);
+            printf("\tmovq $%ld, %s\n", value, target.target_destination);
             return;
         case ASSIGNMENT_STATEMENT:
-            identifier = node->children[0];
-            expression = node->children[1];
+            identifier = target.node->children[0];
+            expression = target.node->children[1];
 
-            // This will find whatever expression we need and put it in %rax
-            generate_node(expression, function, stack_alignment, returned);
-            __write_variable("%rax", identifier->entry, function);
+            __write_variable_accessor(buf, 32, identifier->entry, target.function);
+            child_target.target_destination = buf;
+            child_target.node = expression;
+
+            generate_node(child_target);
             return;
         case ADD_STATEMENT:
         case SUBTRACT_STATEMENT:
         case DIVIDE_STATEMENT:
         case MULTIPLY_STATEMENT:
-            identifier = node->children[0];
-            expression = node->children[1];
+            identifier = target.node->children[0];
+            expression = target.node->children[1];
 
-            generate_node(expression, function, stack_alignment, returned);
-            puts("\tmovq %rax, %r8");
-            __access_variable("%rax", identifier->entry, function);
+            child_target.target_destination = "%r10";
+            child_target.node = expression;
 
-            switch (node->type) {
+            // This will find whatever expression we need and put it in %r10
+            generate_node(child_target);
+            __access_variable("%rax", identifier->entry, target.function);
+
+            switch (target.node->type) {
                 case ADD_STATEMENT:
-                    puts("\taddq %r8, %rax");
+                    puts("\taddq %r10, %rax");
                     break;
                 case SUBTRACT_STATEMENT:
-                    puts("\tsubq %r8, %rax");
+                    puts("\tsubq %r10, %rax");
                     break;
                 case DIVIDE_STATEMENT:
-                    puts("\tidivq %r8");
+                    puts("\tidivq %r10");
                     break;
                 case MULTIPLY_STATEMENT:
-                    puts("\timulq %r8");
+                    puts("\timulq %r10");
                     break;
             }
 
-            __write_variable("%rax", identifier->entry, function);
+            __write_variable("%rax", identifier->entry, target.function);
             return;
         case PRINT_STATEMENT:
             node_t *item;
             unsigned int alignment;
-            for (size_t i = 0; i < node->n_children; i++) {
-                item = node->children[i];
+            for (size_t i = 0; i < target.node->n_children; i++) {
+                item = target.node->children[i];
 
                 switch (item->type) {
                     case STRING_DATA:
                         printf("\tmovq $.strout, %%rdi\n");
                         printf("\tmovq $.STR%ld, %%rsi\n", *((size_t *)item->data));
-
-                        alignment = __align_stack(stack_alignment);
-                        puts("\tcall printf");
-                        __unalign_stack(alignment, stack_alignment);
                         break;
                     case IDENTIFIER_DATA:
                         printf("\tmovq $.intout, %%rdi\n");
-                        __access_variable("%rsi", item->entry, function);
-
-                        alignment = __align_stack(stack_alignment);
-                        puts("\tcall printf");
-                        __unalign_stack(alignment, stack_alignment);
+                        __access_variable("%rsi", item->entry, target.function);
                         break;
                     case EXPRESSION:
-                        generate_node(item, function, stack_alignment, returned);
-                        printf("\tmovq $.intout, %%rdi\n");
-                        puts("\tmovq %rax, %rsi");
+                        child_target.node = item;
+                        child_target.target_destination = "%rsi";
 
-                        alignment = __align_stack(stack_alignment);
-                        puts("\tcall printf");
-                        __unalign_stack(alignment, stack_alignment);
+                        generate_node(child_target);
+                        printf("\tmovq $.intout, %%rdi\n");
                         break;
                 }
+
+                // We align at every print call because expressions etc.
+                // may push variables on the stack, causing an alignment
+                // for this as a whole to not work real well
+                alignment = __align_stack(target.stack_alignment);
+                puts("\tcall printf");
+                __unalign_stack(alignment, target.stack_alignment);
             }
 
             // New line
             printf("\tmovq $.newline, %%rdi\n");
+            alignment = __align_stack(target.stack_alignment);
             puts("\tcall printf");
-
+            __unalign_stack(alignment, target.stack_alignment);
             return;
         case RETURN_STATEMENT:
-            if (returned == NULL) {
-                fprintf(stderr, "Return in illegal position inside %s\n", function->name);
+            if (target.returned == NULL) {
+                fprintf(stderr, "Return in illegal position inside %s\n", target.function->name);
                 exit(EXIT_FAILURE);
             }
 
-            *returned = true;
-            generate_node(node->children[0], function, stack_alignment, returned);
+            *target.returned = true;
+
+            child_target.node = target.node->children[0];
+            child_target.target_destination = "%rax";
+
+            generate_node(child_target);
             puts("\tleave");
             puts("\tret");
             return;
     }
 
     // A return statement has been called, we don't need to continue here
-    if (returned != NULL && *returned) {
+    if (target.returned != NULL && *target.returned) {
         return;
     }
 
     node_t *child;
-    for (size_t i = 0; i < node->n_children; i++) {
-        child = node->children[i];
+    for (size_t i = 0; i < target.node->n_children; i++) {
+        child = target.node->children[i];
         if (child->type == DECLARATION) {
             continue;
         }
 
-        generate_node(child, function, stack_alignment, returned);
+        child_target.node = child;
+        child_target.target_destination = target.target_destination;
+
+        generate_node(child_target);
     }
 }
 
@@ -571,7 +624,7 @@ void generate_main(symbol_t *first) {
 
     unsigned int alignment = __align_stack(&stack_alignment);
     printf("\tcall %s%s\n", FUNC_PREFIX, first->name);
-    __unalign_stack(alignment, stack_alignment);
+    __unalign_stack(alignment, &stack_alignment);
 
     printf("\tjmp\tEND\n");
     printf("ABORT:\n");
