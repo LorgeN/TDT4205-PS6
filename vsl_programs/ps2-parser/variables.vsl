@@ -5,7 +5,6 @@ func my_func(param)
 begin
     var local_var, local_var2
     local_var := 1
-    return local_var
 end
 
 var glob1, glob2
@@ -15,7 +14,6 @@ begin
     var main_local_var
     begin
         var main_local_nested_var
-        main_local_nested_var := main_local_var + my_func(1)
+        main_local_nested_var := main_local_var
     end
-    return 0
 end

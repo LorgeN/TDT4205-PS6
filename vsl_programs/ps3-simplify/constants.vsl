@@ -6,5 +6,4 @@ func main() begin
 
     if a = b then
         print "The answer is", b
-    return 0
 end

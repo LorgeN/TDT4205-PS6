@@ -8,5 +8,4 @@ end
 func main() begin
     var a
     print "a string"
-    return 0
 end

@@ -22,5 +22,4 @@ begin
         else
             print "L", b, "M", c
     // A dangling else, what could go wrong?
-    return 0
 end

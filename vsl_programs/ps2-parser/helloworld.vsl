@@ -1,4 +1,3 @@
-func helloworld() begin
+func main() begin
     print "Hello, World!"
-    return 0
 end

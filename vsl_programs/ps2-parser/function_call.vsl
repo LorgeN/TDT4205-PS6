@@ -5,5 +5,4 @@ end
 func main() 
 begin
     print add(40, 2)
-    return 0
 end

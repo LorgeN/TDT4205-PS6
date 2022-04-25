@@ -11,5 +11,4 @@ begin
     a *= 32
     a -= 2
     print a
-    return 0
 end
