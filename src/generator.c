@@ -76,7 +76,7 @@ void generate_stringtable(void) {
     puts(".errout:\n\t.asciz \"Wrong number of arguments\"");
 
     for (size_t i = 0; i < stringc; i++) {
-        printf(".STR%d:\n\t.asciz %s\n", i, string_list[i]);
+        printf(".STR%lu:\n\t.asciz %s\n", i, string_list[i]);
     }
 }
 
@@ -131,7 +131,7 @@ unsigned int __allocate_aligned_stack(size_t slots, unsigned int *stack_alignmen
         return 0;
     }
 
-    printf("\tsubq $%d, %%rsp\n", slots * 8 + offset);
+    printf("\tsubq $%lu, %%rsp\n", slots * 8 + offset);
     return offset;
 }
 
@@ -141,7 +141,7 @@ void __allocate_stack(size_t slots, unsigned int *stack_alignment) {
     }
 
     *stack_alignment += slots * 8;
-    printf("\tsubq $%d, %%rsp\n", slots * 8);
+    printf("\tsubq $%lu, %%rsp\n", slots * 8);
 }
 
 unsigned int __align_stack(unsigned int *stack_alignment) {
@@ -158,7 +158,7 @@ unsigned int __align_stack(unsigned int *stack_alignment) {
 
 void __unalign_stack(unsigned int alignment, unsigned int *stack_alignment) {
     if (alignment != 0) {
-        printf("\taddq $%d, %rsp\n", alignment);
+        printf("\taddq $%d, %%rsp\n", alignment);
         *stack_alignment -= alignment;
     }
 }
@@ -231,7 +231,7 @@ void generate_function(symbol_t *function) {
         puts("\t# Automatically generated return statement");
         puts("\tmovq $0, %rax");
         puts("\tleave");
-        puts("\rret");
+        puts("\tret");
     }
 }
 
@@ -243,7 +243,7 @@ void __write_param_accessor(size_t param, char *str, size_t nchars) {
         return;
     }
 
-    snprintf(str, nchars, "%d(%%rsp)", (param - 6) * 8);
+    snprintf(str, nchars, "%lu(%%rsp)", (param - 6) * 8);
 }
 
 void __call_function(node_t *node, symbol_t *calling_function, unsigned int *stack_alignment) {
@@ -264,7 +264,7 @@ void __call_function(node_t *node, symbol_t *calling_function, unsigned int *sta
     }
 
     /*
-    This compiler does not utilize the caller-saved registers in a way 
+    This compiler does not utilize the caller-saved registers in a way
     that requires us to save them here, that is to say that any value
     that isn't immediately used is pushed to the stack anyway (this mainly
     applies to expressions)
@@ -310,7 +310,7 @@ void __generate_expression(struct compilation_target_t target) {
 
             // Move if different
             if (strcmp("%rax", target.target_destination)) {
-                printf("\tmovq %rax, %s\n", target.target_destination);
+                printf("\tmovq %%rax, %s\n", target.target_destination);
             }
             return;
         }
@@ -387,8 +387,12 @@ void __generate_expression(struct compilation_target_t target) {
     // but to keep the compiler a bit simpler (because some of them don't),
     // we're doing it in a separate instruction
     if (strncmp("%rax", target.target_destination, 4)) {
-        printf("\tmovq %rax, %s\n", target.target_destination);
+        printf("\tmovq %%rax, %s\n", target.target_destination);
     }
+}
+
+void __generate_conditional(struct compilation_target_t target, node_t *relation) {
+    
 }
 
 void __access_variable(const char *reg, symbol_t *sym, symbol_t *function) {
@@ -447,7 +451,26 @@ void generate_node(struct compilation_target_t target) {
         .stack_alignment = target.stack_alignment,
     };
 
+    bool local_return = false;
+    int64_t value;
+    node_t *item;
+    unsigned int alignment;
+
     switch (target.node->type) {
+        case IF_STATEMENT:
+            // A return inside an if statement doesn't imply that the entire function has
+            // returned.
+            child_target.returned = &local_return;
+
+            return;
+        case WHILE_STATEMENT:
+            // A return inside a while loop doesn't imply that the entire function has
+            // returned.
+            child_target.returned = &local_return;
+
+            return;
+        case NULL_STATEMENT:
+            return;
         case EXPRESSION:
             __generate_expression(target);
             return;
@@ -457,7 +480,7 @@ void generate_node(struct compilation_target_t target) {
             __access_variable(target.target_destination, target.node->entry, target.function);
             return;
         case NUMBER_DATA:
-            int64_t value = *((int64_t *)target.node->data);
+            value = *((int64_t *)target.node->data);
             printf("\tmovq $%ld, %s\n", value, target.target_destination);
             return;
         case ASSIGNMENT_STATEMENT:
@@ -502,8 +525,6 @@ void generate_node(struct compilation_target_t target) {
             __write_variable("%rax", identifier->entry, target.function);
             return;
         case PRINT_STATEMENT:
-            node_t *item;
-            unsigned int alignment;
             for (size_t i = 0; i < target.node->n_children; i++) {
                 item = target.node->children[i];
 
