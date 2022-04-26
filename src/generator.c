@@ -16,6 +16,8 @@ struct compilation_target_t {
     // The target destination of the value of this node, such as a
     // register or memory address
     char *target_destination;
+    // Some number we use to mangle labels to make them unique
+    unsigned int *label_mangle_index;
 };
 
 /**Generate table of strings in a rodata section. */
@@ -163,6 +165,11 @@ void __unalign_stack(unsigned int alignment, unsigned int *stack_alignment) {
     }
 }
 
+void __apply_label(char *buf, size_t maxlen, char *prefix, struct compilation_target_t target) {
+    snprintf(buf, maxlen, "._%s_%s%u", target.function->name, prefix, (*target.label_mangle_index)++);
+    printf("\t%s:", buf);
+}
+
 void __move_reg_to_slot(const char *reg, int slot) {
     printf("\tmovq %s, %d(%%rbp)\n", reg, (slot + 1) * -8);
 }
@@ -204,6 +211,7 @@ void generate_function(symbol_t *function) {
     // At this stage the stack is aligned, since we've got
     // return address and rbp pushed.
     unsigned int stack_alignment = 0;
+    unsigned int mangle_index = 0;
     bool returned = false;
     __allocate_stack(paramc + __get_variable_count(function), &stack_alignment);
 
@@ -222,7 +230,8 @@ void generate_function(symbol_t *function) {
         .node = function->node,
         .stack_alignment = &stack_alignment,
         .target_destination = "%rax",
-        .returned = &returned};
+        .returned = &returned,
+        .label_mangle_index = &mangle_index};
 
     generate_node(target);
 
@@ -246,20 +255,20 @@ void __write_param_accessor(size_t param, char *str, size_t nchars) {
     snprintf(str, nchars, "%lu(%%rsp)", (param - 6) * 8);
 }
 
-void __call_function(node_t *node, symbol_t *calling_function, unsigned int *stack_alignment) {
+void __call_function(struct compilation_target_t target) {
     if (node->n_children != 2) {
         fprintf(stderr, "Invalid function call\n");
         exit(EXIT_FAILURE);
     }
 
-    node_t *identifier = node->children[0];
+    node_t *identifier = target.node->children[0];
     symbol_t *func = identifier->entry;
 
-    node_t *argument_list = node->children[1];
+    node_t *argument_list = target.node->children[1];
 
     int args_provided = argument_list == NULL ? 0 : argument_list->n_children;
     if (args_provided != func->nparms) {
-        fprintf(stderr, "Wrong number of arguments for call to %s in %s\n", func->name, calling_function->name);
+        fprintf(stderr, "Wrong number of arguments for call to %s in %s\n", func->name, target.function->name);
         exit(EXIT_FAILURE);
     }
 
@@ -271,7 +280,7 @@ void __call_function(node_t *node, symbol_t *calling_function, unsigned int *sta
     */
 
     unsigned int required_stack_space = MAX(6, func->nparms) - 6;
-    unsigned int alignment = __allocate_aligned_stack(required_stack_space, stack_alignment);
+    unsigned int alignment = __allocate_aligned_stack(required_stack_space, target.stack_alignment);
 
     char access_buffer[32] = {0};
     node_t *arg;
@@ -280,17 +289,18 @@ void __call_function(node_t *node, symbol_t *calling_function, unsigned int *sta
 
         __write_param_accessor(param, access_buffer, 32);
         struct compilation_target_t target = {
-            .function = calling_function,
+            .function = target.function,
             .node = arg,
-            .stack_alignment = stack_alignment,
+            .stack_alignment = target.stack_alignment,
             .returned = NULL,
-            .target_destination = access_buffer};
+            .target_destination = access_buffer,
+            .label_mangle_index = target.label_mangle_index};
 
         generate_node(target);
     }
 
     printf("\tcall %s%s\n", FUNC_PREFIX, func->name);
-    __unalign_stack(alignment, stack_alignment);
+    __unalign_stack(alignment, target.stack_alignment);
 }
 
 void __generate_expression(struct compilation_target_t target) {
@@ -306,7 +316,7 @@ void __generate_expression(struct compilation_target_t target) {
         // This is then a function call
         if (target.node->n_children == 2) {
             // This will put the result in %rax
-            __call_function(target.node, target.function, target.stack_alignment);
+            __call_function(target);
 
             // Move if different
             if (strcmp("%rax", target.target_destination)) {
@@ -347,14 +357,17 @@ void __generate_expression(struct compilation_target_t target) {
         .function = target.function,
         .stack_alignment = target.stack_alignment,
         .returned = target.returned,
-        .target_destination = "%rax"};
+        .target_destination = "%rax",
+        .label_mangle_index = target.label_mangle_index};
 
     generate_node(child_target);
+    *target.stack_alignment += 8;
     puts("\tpushq %rax");  // Store temporary value
 
     child_target.node = c1;
 
     generate_node(child_target);
+    *target.stack_alignment -= 8;
     puts("\tpopq %r10");  // Retrieve previously calculated value
 
     // Now have lh side in rax and rh side in r8
@@ -391,8 +404,31 @@ void __generate_expression(struct compilation_target_t target) {
     }
 }
 
-void __generate_conditional(struct compilation_target_t target, node_t *relation) {
-    
+void __generate_conditional(struct compilation_target_t target) {
+    node_t *relation = target.node;
+
+    char *type = (char *)relation->data;
+    // These both have to be expressions according to the grammar
+    node_t *lh_expr = relation->children[0];
+    node_t *rh_expr = relation->children[1];
+
+    struct compilation_target_t child_target = {
+        .function = target.function,
+        .returned = NULL,
+        .stack_alignment = target.stack_alignment,
+        .target_destination = "%r11",
+        .label_mangle_index = target.label_mangle_index};
+
+    child_target.node = lh_expr;
+    __generate_expression(child_target);
+    *target.stack_alignment += 8;
+    puts("\tpushq %r11");
+
+    child_target.node = rh_expr;
+    __generate_expression(child_target);
+    *target.stack_alignment -= 8;
+    puts("\tpopq %r10");
+    puts("\tcmp %r10, %r11");
 }
 
 void __access_variable(const char *reg, symbol_t *sym, symbol_t *function) {
@@ -449,7 +485,7 @@ void generate_node(struct compilation_target_t target) {
         .function = target.function,
         .returned = target.returned,
         .stack_alignment = target.stack_alignment,
-    };
+        .label_mangle_index = target.label_mangle_index};
 
     bool local_return = false;
     int64_t value;
