@@ -2,6 +2,6 @@ make clean
 make
 cd vsl_programs
 make clean
-make ps5
-make ps5-compile
+make ps6
+make ps6-compile
 cd ..
