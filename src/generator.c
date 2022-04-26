@@ -165,9 +165,12 @@ void __unalign_stack(unsigned int alignment, unsigned int *stack_alignment) {
     }
 }
 
-void __apply_label(char *buf, size_t maxlen, char *prefix, struct compilation_target_t target) {
+void __make_label(char *buf, size_t maxlen, char *prefix, struct compilation_target_t target) {
     snprintf(buf, maxlen, "._%s_%s%u", target.function->name, prefix, (*target.label_mangle_index)++);
-    printf("\t%s:", buf);
+}
+
+void __label_here(char *buf) {
+    printf("%s:\n", buf);
 }
 
 void __move_reg_to_slot(const char *reg, int slot) {
@@ -256,7 +259,7 @@ void __write_param_accessor(size_t param, char *str, size_t nchars) {
 }
 
 void __call_function(struct compilation_target_t target) {
-    if (node->n_children != 2) {
+    if (target.node->n_children != 2) {
         fprintf(stderr, "Invalid function call\n");
         exit(EXIT_FAILURE);
     }
@@ -288,7 +291,7 @@ void __call_function(struct compilation_target_t target) {
         arg = argument_list->children[param];
 
         __write_param_accessor(param, access_buffer, 32);
-        struct compilation_target_t target = {
+        struct compilation_target_t child_target = {
             .function = target.function,
             .node = arg,
             .stack_alignment = target.stack_alignment,
@@ -296,7 +299,7 @@ void __call_function(struct compilation_target_t target) {
             .target_destination = access_buffer,
             .label_mangle_index = target.label_mangle_index};
 
-        generate_node(target);
+        generate_node(child_target);
     }
 
     printf("\tcall %s%s\n", FUNC_PREFIX, func->name);
@@ -304,8 +307,6 @@ void __call_function(struct compilation_target_t target) {
 }
 
 void __generate_expression(struct compilation_target_t target) {
-    // For all calls here we disallow the return statement so we can pass a null pointer
-
     char *op = target.node->data;
     if (op == NULL) {
         // This means that we have either
@@ -341,10 +342,10 @@ void __generate_expression(struct compilation_target_t target) {
 
         switch (*op) {
             case '-':
-                printf("\tneg %s\n", target.target_destination);
+                printf("\tnegq %s\n", target.target_destination);
                 break;
             case '~':
-                printf("\tnot %s\n", target.target_destination);
+                printf("\tnotq %s\n", target.target_destination);
                 break;
         }
         return;
@@ -352,11 +353,12 @@ void __generate_expression(struct compilation_target_t target) {
 
     node_t *c2 = target.node->children[1];
 
+    // For all calls here we disallow the return statement so we can pass a null pointer
     struct compilation_target_t child_target = {
         .node = c2,
         .function = target.function,
         .stack_alignment = target.stack_alignment,
-        .returned = target.returned,
+        .returned = NULL,
         .target_destination = "%rax",
         .label_mangle_index = target.label_mangle_index};
 
@@ -374,13 +376,13 @@ void __generate_expression(struct compilation_target_t target) {
 
     switch (*op) {
         case '|':
-            puts("\tor %r10, %rax");
+            puts("\torq %r10, %rax");
             break;
         case '^':
-            puts("\txor %r10, %rax");
+            puts("\txorq %r10, %rax");
             break;
         case '&':
-            puts("\tand %r10, %rax");
+            puts("\tandq %r10, %rax");
             break;
         case '+':
             puts("\taddq %r10, %rax");
@@ -392,6 +394,8 @@ void __generate_expression(struct compilation_target_t target) {
             puts("\timulq %r10");
             break;
         case '/':
+            // Extends sign so that it is rdx:rax. This is required by idivq
+            puts("\tcqto");
             puts("\tidivq %r10");
             break;
     }
@@ -408,7 +412,6 @@ void __generate_conditional(struct compilation_target_t target) {
     node_t *relation = target.node;
 
     char *type = (char *)relation->data;
-    // These both have to be expressions according to the grammar
     node_t *lh_expr = relation->children[0];
     node_t *rh_expr = relation->children[1];
 
@@ -416,19 +419,20 @@ void __generate_conditional(struct compilation_target_t target) {
         .function = target.function,
         .returned = NULL,
         .stack_alignment = target.stack_alignment,
-        .target_destination = "%r11",
+        .target_destination = "%rax",
         .label_mangle_index = target.label_mangle_index};
 
     child_target.node = lh_expr;
-    __generate_expression(child_target);
+    generate_node(child_target);
     *target.stack_alignment += 8;
-    puts("\tpushq %r11");
+    puts("\tpushq %rax");
 
+    child_target.target_destination = "%r11";
     child_target.node = rh_expr;
-    __generate_expression(child_target);
+    generate_node(child_target);
     *target.stack_alignment -= 8;
     puts("\tpopq %r10");
-    puts("\tcmp %r10, %r11");
+    puts("\tcmp %r11, %r10");
 }
 
 void __access_variable(const char *reg, symbol_t *sym, symbol_t *function) {
@@ -480,7 +484,7 @@ void generate_node(struct compilation_target_t target) {
     node_t *identifier;
     node_t *expression;
 
-    char buf[32] = {0};
+    char string_buf[64] = {0};
     struct compilation_target_t child_target = {
         .function = target.function,
         .returned = target.returned,
@@ -498,6 +502,47 @@ void generate_node(struct compilation_target_t target) {
             // returned.
             child_target.returned = &local_return;
 
+            node_t *relation = target.node->children[0];
+            child_target.node = relation;
+            __generate_conditional(child_target);
+
+            bool has_else = target.node->n_children == 3;
+            __make_label(string_buf, 64, has_else ? "ELSE" : "ENDIF", child_target);
+
+            // Dereference to char
+            switch (*((char *)relation->data)) {
+                case '=':
+                    printf("\tjne %s\n", string_buf);
+                    break;
+                case '>':
+                    printf("\tjng %s\n", string_buf);
+                    break;
+                case '<':
+                    printf("\tjnl %s\n", string_buf);
+                    break;
+                default:
+                    fprintf(stderr, "Unknown relation operator %c\n", *((char *)relation->data));
+                    break;
+            }
+
+            child_target.node = target.node->children[1];
+            generate_node(child_target);
+
+            // Secondary buffer used when we have an if-else statement
+            char else_end_buffer[64] = {0};
+
+            if (has_else) {
+                child_target.node = target.node->children[2];
+                __make_label(else_end_buffer, 64, "ENDIF", child_target);
+                printf("\tjmp %s\n", else_end_buffer);
+            }
+
+            __label_here(string_buf);
+
+            if (has_else) {
+                generate_node(child_target);
+                __label_here(else_end_buffer);
+            }
             return;
         case WHILE_STATEMENT:
             // A return inside a while loop doesn't imply that the entire function has
@@ -523,11 +568,12 @@ void generate_node(struct compilation_target_t target) {
             identifier = target.node->children[0];
             expression = target.node->children[1];
 
-            __write_variable_accessor(buf, 32, identifier->entry, target.function);
-            child_target.target_destination = buf;
+            __write_variable_accessor(string_buf, 32, identifier->entry, target.function);
+            child_target.target_destination = "%rax";
             child_target.node = expression;
 
             generate_node(child_target);
+            printf("\tmovq %rax, %s\n", string_buf);
             return;
         case ADD_STATEMENT:
         case SUBTRACT_STATEMENT:
@@ -551,6 +597,8 @@ void generate_node(struct compilation_target_t target) {
                     puts("\tsubq %r10, %rax");
                     break;
                 case DIVIDE_STATEMENT:
+                    // Extends sign so that it is rdx:rax. This is required by idivq
+                    puts("\tcqto");
                     puts("\tidivq %r10");
                     break;
                 case MULTIPLY_STATEMENT:
