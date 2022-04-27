@@ -96,7 +96,7 @@ void generate_global_variables(size_t n_globals, symbol_t **global_list) {
             continue;
         }
 
-        printf(".%s:\n", sym->name);
+        printf(".%s: .zero 8\n", sym->name);
     }
 }
 
@@ -510,6 +510,7 @@ static void generate_if_statement(struct compilation_target_t target) {
     char first_skip_label[LABEL_MAX_SIZE] = {0};
     char control_end_buffer[LABEL_MAX_SIZE] = {0};
     bool local_return = false;
+    bool return1;
 
     struct compilation_target_t child_target = {
         .function = target.function,
@@ -529,18 +530,33 @@ static void generate_if_statement(struct compilation_target_t target) {
 
     child_target.node = target.node->children[1];
     generate_node(child_target);
+    return1 = local_return;
 
     if (has_else) {
         child_target.node = target.node->children[2];
         make_label(control_end_buffer, LABEL_MAX_SIZE, "ENDIF", child_target);
-        printf("\tjmp %s\n", control_end_buffer);
+
+        // This skips the jump instruction if the body of the if-statement
+        // calls return, meaning we will never get to the jump instruction
+        if (!return1) {
+            printf("\tjmp %s\n", control_end_buffer);
+        }
     }
 
     label_here(first_skip_label);
 
     if (has_else) {
         generate_node(child_target);
-        label_here(control_end_buffer);
+
+        // This skips the last label of the block, and also marks the
+        // parent target as returned since both paths of this if-statement
+        // end with us leaving the current function meaning we also don't
+        // need the automatically generated "return 0" statement (See L246)
+        if (return1 && local_return) {
+            *target.returned = true;
+        } else {
+            label_here(control_end_buffer);
+        }
     }
 
     // Increase for next use so that each control structure has its own "ID"
