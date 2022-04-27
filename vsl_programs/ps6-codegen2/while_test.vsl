@@ -1,5 +1,5 @@
 // This program is a simple test of while loops, counting down from 19 to 0
-// and skipping 10 (if continue is implemented)
+// and skipping 9 (if continue is implemented)
 
 func while_test ()
 begin

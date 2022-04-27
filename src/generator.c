@@ -18,6 +18,8 @@ struct compilation_target_t {
     char *target_destination;
     // Some number we use to mangle labels to make them unique
     unsigned int *label_mangle_index;
+    // Jump label for NULL_STATEMENT
+    char *surrounding_loop_label;
 };
 
 /**Generate table of strings in a rodata section. */
@@ -35,6 +37,7 @@ static void generate_main(symbol_t *first);
 
 // Prefix for all functions that are compiled
 #define FUNC_PREFIX "_func_"
+#define LABEL_MAX_SIZE 128
 
 // Macros that avoid evaluating twice
 #define MIN(a, b) \
@@ -120,7 +123,7 @@ void generate_functions(symbol_t **main, size_t n_globals, symbol_t **global_lis
     }
 }
 
-unsigned int __allocate_aligned_stack(size_t slots, unsigned int *stack_alignment) {
+static unsigned int allocate_aligned_stack(size_t slots, unsigned int *stack_alignment) {
     *stack_alignment += slots * 8;
 
     unsigned int offset = 0;
@@ -137,7 +140,7 @@ unsigned int __allocate_aligned_stack(size_t slots, unsigned int *stack_alignmen
     return offset;
 }
 
-void __allocate_stack(size_t slots, unsigned int *stack_alignment) {
+static void allocate_stack(size_t slots, unsigned int *stack_alignment) {
     if (slots == 0) {
         return;
     }
@@ -146,7 +149,7 @@ void __allocate_stack(size_t slots, unsigned int *stack_alignment) {
     printf("\tsubq $%lu, %%rsp\n", slots * 8);
 }
 
-unsigned int __align_stack(unsigned int *stack_alignment) {
+static unsigned int align_stack(unsigned int *stack_alignment) {
     // Stack is already aligned
     if ((*stack_alignment) % 16 == 0) {
         return 0;
@@ -158,42 +161,42 @@ unsigned int __align_stack(unsigned int *stack_alignment) {
     return offset;
 }
 
-void __unalign_stack(unsigned int alignment, unsigned int *stack_alignment) {
+static void unalign_stack(unsigned int alignment, unsigned int *stack_alignment) {
     if (alignment != 0) {
         printf("\taddq $%d, %%rsp\n", alignment);
         *stack_alignment -= alignment;
     }
 }
 
-void __make_label(char *buf, size_t maxlen, char *prefix, struct compilation_target_t target) {
-    snprintf(buf, maxlen, "._%s_%s%u", target.function->name, prefix, (*target.label_mangle_index)++);
+static void make_label(char *buf, size_t maxlen, char *prefix, struct compilation_target_t target) {
+    snprintf(buf, maxlen, "._%s_%s%u", target.function->name, prefix, *target.label_mangle_index);
 }
 
-void __label_here(char *buf) {
+static void label_here(char *buf) {
     printf("%s:\n", buf);
 }
 
-void __move_reg_to_slot(const char *reg, int slot) {
+static void move_reg_to_slot(const char *reg, int slot) {
     printf("\tmovq %s, %d(%%rbp)\n", reg, (slot + 1) * -8);
 }
 
-void __move_slot_to_reg(const char *reg, int slot) {
+static void move_slot_to_reg(const char *reg, int slot) {
     printf("\tmovq %d(%%rbp), %s\n", (slot + 1) * -8, reg);
 }
 
-void __move_reg_to_global(const char *reg, char *global) {
+static void move_reg_to_global(const char *reg, char *global) {
     printf("\tmovq %s, .%s\n", reg, global);
 }
 
-void __move_global_to_reg(const char *reg, char *global) {
+static void move_global_to_reg(const char *reg, char *global) {
     printf("\tmovq .%s, %s\n", global, reg);
 }
 
-size_t __get_variable_count(symbol_t *function) {
+static size_t get_variable_count(symbol_t *function) {
     return tlhash_size(function->locals) - function->nparms;
 }
 
-int __get_slot(symbol_t *function, symbol_t *sym) {
+static int get_slot(symbol_t *function, symbol_t *sym) {
     if (sym->type == SYM_PARAMETER) {
         return MIN(5, function->nparms - 1) - sym->seq;
     }
@@ -216,14 +219,14 @@ void generate_function(symbol_t *function) {
     unsigned int stack_alignment = 0;
     unsigned int mangle_index = 0;
     bool returned = false;
-    __allocate_stack(paramc + __get_variable_count(function), &stack_alignment);
+    allocate_stack(paramc + get_variable_count(function), &stack_alignment);
 
     // Move this in right to left order so that parameter 0
     // is at the top of the stack. This also means that our
     // parameters will be in order on the stack, with 0 at
     // the top.
     for (int param = 0; param < paramc; param++) {
-        __move_reg_to_slot(PARAMETER_REGISTERS[paramc - param - 1], param);
+        move_reg_to_slot(PARAMETER_REGISTERS[paramc - param - 1], param);
     }
 
     // All parameters are now on the stack
@@ -234,7 +237,8 @@ void generate_function(symbol_t *function) {
         .stack_alignment = &stack_alignment,
         .target_destination = "%rax",
         .returned = &returned,
-        .label_mangle_index = &mangle_index};
+        .label_mangle_index = &mangle_index,
+        .surrounding_loop_label = NULL};
 
     generate_node(target);
 
@@ -247,7 +251,7 @@ void generate_function(symbol_t *function) {
     }
 }
 
-void __write_param_accessor(size_t param, char *str, size_t nchars) {
+static void write_param_accessor(size_t param, char *str, size_t nchars) {
     memset(str, 0, nchars);  // Reset buffer
 
     if (param < 6) {
@@ -258,7 +262,7 @@ void __write_param_accessor(size_t param, char *str, size_t nchars) {
     snprintf(str, nchars, "%lu(%%rsp)", (param - 6) * 8);
 }
 
-void __call_function(struct compilation_target_t target) {
+static void call_function(struct compilation_target_t target) {
     if (target.node->n_children != 2) {
         fprintf(stderr, "Invalid function call\n");
         exit(EXIT_FAILURE);
@@ -283,30 +287,31 @@ void __call_function(struct compilation_target_t target) {
     */
 
     unsigned int required_stack_space = MAX(6, func->nparms) - 6;
-    unsigned int alignment = __allocate_aligned_stack(required_stack_space, target.stack_alignment);
+    unsigned int alignment = allocate_aligned_stack(required_stack_space, target.stack_alignment);
 
     char access_buffer[32] = {0};
     node_t *arg;
     for (size_t param = 0; param < func->nparms; param++) {
         arg = argument_list->children[param];
 
-        __write_param_accessor(param, access_buffer, 32);
+        write_param_accessor(param, access_buffer, 32);
         struct compilation_target_t child_target = {
             .function = target.function,
             .node = arg,
             .stack_alignment = target.stack_alignment,
             .returned = NULL,
             .target_destination = access_buffer,
-            .label_mangle_index = target.label_mangle_index};
+            .label_mangle_index = target.label_mangle_index,
+            .surrounding_loop_label = target.surrounding_loop_label};
 
         generate_node(child_target);
     }
 
     printf("\tcall %s%s\n", FUNC_PREFIX, func->name);
-    __unalign_stack(alignment, target.stack_alignment);
+    unalign_stack(alignment, target.stack_alignment);
 }
 
-void __generate_expression(struct compilation_target_t target) {
+static void generate_expression(struct compilation_target_t target) {
     char *op = target.node->data;
     if (op == NULL) {
         // This means that we have either
@@ -317,7 +322,7 @@ void __generate_expression(struct compilation_target_t target) {
         // This is then a function call
         if (target.node->n_children == 2) {
             // This will put the result in %rax
-            __call_function(target);
+            call_function(target);
 
             // Move if different
             if (strcmp("%rax", target.target_destination)) {
@@ -360,7 +365,8 @@ void __generate_expression(struct compilation_target_t target) {
         .stack_alignment = target.stack_alignment,
         .returned = NULL,
         .target_destination = "%rax",
-        .label_mangle_index = target.label_mangle_index};
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label};
 
     generate_node(child_target);
     *target.stack_alignment += 8;
@@ -408,7 +414,7 @@ void __generate_expression(struct compilation_target_t target) {
     }
 }
 
-void __generate_conditional(struct compilation_target_t target) {
+static void generate_conditional(struct compilation_target_t target) {
     node_t *relation = target.node;
 
     char *type = (char *)relation->data;
@@ -420,7 +426,8 @@ void __generate_conditional(struct compilation_target_t target) {
         .returned = NULL,
         .stack_alignment = target.stack_alignment,
         .target_destination = "%rax",
-        .label_mangle_index = target.label_mangle_index};
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label};
 
     child_target.node = lh_expr;
     generate_node(child_target);
@@ -435,14 +442,14 @@ void __generate_conditional(struct compilation_target_t target) {
     puts("\tcmp %r11, %r10");
 }
 
-void __access_variable(const char *reg, symbol_t *sym, symbol_t *function) {
+static void access_variable(const char *reg, symbol_t *sym, symbol_t *function) {
     switch (sym->type) {
         case SYM_GLOBAL_VAR:
-            __move_global_to_reg(reg, sym->name);
+            move_global_to_reg(reg, sym->name);
             break;
         case SYM_LOCAL_VAR:
         case SYM_PARAMETER:
-            __move_slot_to_reg(reg, __get_slot(function, sym));
+            move_slot_to_reg(reg, get_slot(function, sym));
             break;
         default:
             fprintf(stderr, "Unsupported symbol type for identifier data \"%s\"\n", sym->name);
@@ -450,14 +457,14 @@ void __access_variable(const char *reg, symbol_t *sym, symbol_t *function) {
     }
 }
 
-void __write_variable(const char *reg, symbol_t *sym, symbol_t *function) {
+static void write_variable(const char *reg, symbol_t *sym, symbol_t *function) {
     switch (sym->type) {
         case SYM_GLOBAL_VAR:
-            __move_reg_to_global(reg, sym->name);
+            move_reg_to_global(reg, sym->name);
             break;
         case SYM_LOCAL_VAR:
         case SYM_PARAMETER:
-            __move_reg_to_slot(reg, __get_slot(function, sym));
+            move_reg_to_slot(reg, get_slot(function, sym));
             break;
         default:
             fprintf(stderr, "Unsupported symbol type for identifier data \"%s\"\n", sym->name);
@@ -465,14 +472,14 @@ void __write_variable(const char *reg, symbol_t *sym, symbol_t *function) {
     }
 }
 
-void __write_variable_accessor(char *buf, size_t bufsize, symbol_t *sym, symbol_t *function) {
+static void write_variable_accessor(char *buf, size_t bufsize, symbol_t *sym, symbol_t *function) {
     switch (sym->type) {
         case SYM_GLOBAL_VAR:
             snprintf(buf, bufsize, ".%s", sym->name);
             break;
         case SYM_LOCAL_VAR:
         case SYM_PARAMETER:
-            snprintf(buf, bufsize, "%d(%%rbp)", (__get_slot(function, sym) + 1) * -8);
+            snprintf(buf, bufsize, "%d(%%rbp)", (get_slot(function, sym) + 1) * -8);
             break;
         default:
             fprintf(stderr, "Unsupported symbol type for identifier data \"%s\"\n", sym->name);
@@ -480,184 +487,262 @@ void __write_variable_accessor(char *buf, size_t bufsize, symbol_t *sym, symbol_
     }
 }
 
-void generate_node(struct compilation_target_t target) {
-    node_t *identifier;
-    node_t *expression;
+static void skip_jump_by_relation(char relation, char *label) {
+    switch (relation) {
+        case '=':
+            printf("\tjne %s\n", label);
+            break;
+        case '>':
+            printf("\tjng %s\n", label);
+            break;
+        case '<':
+            printf("\tjnl %s\n", label);
+            break;
+        default:
+            fprintf(stderr, "Unknown relation operator %c\n", relation);
+            break;
+    }
+}
 
-    char string_buf[64] = {0};
+static void generate_if_statement(struct compilation_target_t target) {
+    node_t *relation;
+
+    char first_skip_label[LABEL_MAX_SIZE] = {0};
+    char control_end_buffer[LABEL_MAX_SIZE] = {0};
+    bool local_return = false;
+
+    struct compilation_target_t child_target = {
+        .function = target.function,
+        .returned = &local_return,
+        .stack_alignment = target.stack_alignment,
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label};
+
+    relation = target.node->children[0];
+    child_target.node = relation;
+    generate_conditional(child_target);
+
+    bool has_else = target.node->n_children == 3;
+    make_label(first_skip_label, LABEL_MAX_SIZE, has_else ? "ELSE" : "ENDIF", child_target);
+
+    skip_jump_by_relation(*((char *)relation->data), first_skip_label);
+
+    child_target.node = target.node->children[1];
+    generate_node(child_target);
+
+    if (has_else) {
+        child_target.node = target.node->children[2];
+        make_label(control_end_buffer, LABEL_MAX_SIZE, "ENDIF", child_target);
+        printf("\tjmp %s\n", control_end_buffer);
+    }
+
+    label_here(first_skip_label);
+
+    if (has_else) {
+        generate_node(child_target);
+        label_here(control_end_buffer);
+    }
+
+    // Increase for next use so that each control structure has its own "ID"
+    (*target.label_mangle_index)++;
+}
+
+static void generate_while_statement(struct compilation_target_t target) {
+    char check_label[LABEL_MAX_SIZE] = {0};
+    char end_label[LABEL_MAX_SIZE] = {0};
+    bool local_return = false;
+
+    struct compilation_target_t child_target = {
+        .function = target.function,
+        .returned = &local_return,
+        .stack_alignment = target.stack_alignment,
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label};
+
+    make_label(check_label, LABEL_MAX_SIZE, "WCHECK", child_target);
+    make_label(end_label, LABEL_MAX_SIZE, "WEND", child_target);
+    label_here(check_label);
+
+    node_t *relation = target.node->children[0];
+    node_t *body = target.node->children[1];
+
+    child_target.node = relation;
+    generate_conditional(child_target);
+    skip_jump_by_relation(*((char *)relation->data), end_label);
+
+    child_target.surrounding_loop_label = check_label;
+    child_target.node = body;
+    generate_node(child_target);
+    printf("\tjmp %s\n", check_label);
+    label_here(end_label);
+
+    // Increase for next use so that each control structure has its own "ID"
+    (*target.label_mangle_index)++;
+}
+
+static void generate_assignment(struct compilation_target_t target) {
+    node_t *var = target.node->children[0];
+    node_t *value = target.node->children[1];
+
     struct compilation_target_t child_target = {
         .function = target.function,
         .returned = target.returned,
         .stack_alignment = target.stack_alignment,
-        .label_mangle_index = target.label_mangle_index};
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label};
 
-    bool local_return = false;
-    int64_t value;
+    char variable_accessor[64] = {0};
+
+    if (target.node->type == ASSIGNMENT_STATEMENT) {
+        write_variable_accessor(variable_accessor, 64, var->entry, target.function);
+        child_target.target_destination = "%rax";
+        child_target.node = value;
+
+        generate_node(child_target);
+        printf("\tmovq %rax, %s\n", variable_accessor);
+        return;
+    }
+
+    child_target.target_destination = "%r10";
+    child_target.node = value;
+
+    // This will find whatever expression we need and put it in %r10
+    generate_node(child_target);
+    access_variable("%rax", var->entry, target.function);
+
+    switch (target.node->type) {
+        case ADD_STATEMENT:
+            puts("\taddq %r10, %rax");
+            break;
+        case SUBTRACT_STATEMENT:
+            puts("\tsubq %r10, %rax");
+            break;
+        case DIVIDE_STATEMENT:
+            // Extends sign so that it is rdx:rax. This is required by idivq
+            puts("\tcqto");
+            puts("\tidivq %r10");
+            break;
+        case MULTIPLY_STATEMENT:
+            puts("\timulq %r10");
+            break;
+    }
+
+    write_variable("%rax", var->entry, target.function);
+}
+
+static void genereate_number_data(struct compilation_target_t target) {
+    int64_t value = *((int64_t *)target.node->data);
+    printf("\tmovq $%ld, %s\n", value, target.target_destination);
+}
+
+static void generate_print_statement(struct compilation_target_t target) {
+    struct compilation_target_t child_target = {
+        .function = target.function,
+        .returned = target.returned,
+        .stack_alignment = target.stack_alignment,
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label};
+
     node_t *item;
     unsigned int alignment;
 
+    for (size_t i = 0; i < target.node->n_children; i++) {
+        item = target.node->children[i];
+
+        switch (item->type) {
+            case STRING_DATA:
+                printf("\tmovq $.strout, %%rdi\n");
+                printf("\tmovq $.STR%ld, %%rsi\n", *((size_t *)item->data));
+                break;
+            case IDENTIFIER_DATA:
+                printf("\tmovq $.intout, %%rdi\n");
+                access_variable("%rsi", item->entry, target.function);
+                break;
+            case EXPRESSION:
+                child_target.node = item;
+                child_target.target_destination = "%rsi";
+
+                generate_node(child_target);
+                printf("\tmovq $.intout, %%rdi\n");
+                break;
+        }
+
+        // We align at every print call because expressions etc.
+        // may push variables on the stack, causing an alignment
+        // for this as a whole to not work real well
+        alignment = align_stack(target.stack_alignment);
+        puts("\tcall printf");
+        unalign_stack(alignment, target.stack_alignment);
+    }
+
+    // New line
+    printf("\tmovq $.newline, %%rdi\n");
+    alignment = align_stack(target.stack_alignment);
+    puts("\tcall printf");
+    unalign_stack(alignment, target.stack_alignment);
+}
+
+static void generate_return_statement(struct compilation_target_t target) {
+    if (target.returned == NULL) {
+        fprintf(stderr, "Return in illegal position inside %s\n", target.function->name);
+        exit(EXIT_FAILURE);
+    }
+
+    *target.returned = true;
+
+    struct compilation_target_t child_target = {
+        .function = target.function,
+        .returned = target.returned,
+        .stack_alignment = target.stack_alignment,
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label,
+        .node = target.node->children[0],
+        .target_destination = "%rax"};
+
+    generate_node(child_target);
+    puts("\tleave");
+    puts("\tret");
+}
+
+void generate_node(struct compilation_target_t target) {
     switch (target.node->type) {
         case IF_STATEMENT:
-            // A return inside an if statement doesn't imply that the entire function has
-            // returned.
-            child_target.returned = &local_return;
-
-            node_t *relation = target.node->children[0];
-            child_target.node = relation;
-            __generate_conditional(child_target);
-
-            bool has_else = target.node->n_children == 3;
-            __make_label(string_buf, 64, has_else ? "ELSE" : "ENDIF", child_target);
-
-            // Dereference to char
-            switch (*((char *)relation->data)) {
-                case '=':
-                    printf("\tjne %s\n", string_buf);
-                    break;
-                case '>':
-                    printf("\tjng %s\n", string_buf);
-                    break;
-                case '<':
-                    printf("\tjnl %s\n", string_buf);
-                    break;
-                default:
-                    fprintf(stderr, "Unknown relation operator %c\n", *((char *)relation->data));
-                    break;
-            }
-
-            child_target.node = target.node->children[1];
-            generate_node(child_target);
-
-            // Secondary buffer used when we have an if-else statement
-            char else_end_buffer[64] = {0};
-
-            if (has_else) {
-                child_target.node = target.node->children[2];
-                __make_label(else_end_buffer, 64, "ENDIF", child_target);
-                printf("\tjmp %s\n", else_end_buffer);
-            }
-
-            __label_here(string_buf);
-
-            if (has_else) {
-                generate_node(child_target);
-                __label_here(else_end_buffer);
-            }
+            generate_if_statement(target);
             return;
         case WHILE_STATEMENT:
-            // A return inside a while loop doesn't imply that the entire function has
-            // returned.
-            child_target.returned = &local_return;
-
+            generate_while_statement(target);
             return;
         case NULL_STATEMENT:
+            if (target.surrounding_loop_label == NULL) {
+                fprintf(stderr, "Continue in illegal position inside %s\n", target.function->name);
+                exit(EXIT_FAILURE);
+            }
+
+            printf("\tjmp %s\n", target.surrounding_loop_label);
             return;
         case EXPRESSION:
-            __generate_expression(target);
+            generate_expression(target);
             return;
         case IDENTIFIER_DATA:
             // This assumes the case where we want to access the value in the
             // referenced variable. Assignments are handled separately.
-            __access_variable(target.target_destination, target.node->entry, target.function);
+            access_variable(target.target_destination, target.node->entry, target.function);
             return;
         case NUMBER_DATA:
-            value = *((int64_t *)target.node->data);
-            printf("\tmovq $%ld, %s\n", value, target.target_destination);
+            genereate_number_data(target);
             return;
         case ASSIGNMENT_STATEMENT:
-            identifier = target.node->children[0];
-            expression = target.node->children[1];
-
-            __write_variable_accessor(string_buf, 32, identifier->entry, target.function);
-            child_target.target_destination = "%rax";
-            child_target.node = expression;
-
-            generate_node(child_target);
-            printf("\tmovq %rax, %s\n", string_buf);
-            return;
         case ADD_STATEMENT:
         case SUBTRACT_STATEMENT:
         case DIVIDE_STATEMENT:
         case MULTIPLY_STATEMENT:
-            identifier = target.node->children[0];
-            expression = target.node->children[1];
-
-            child_target.target_destination = "%r10";
-            child_target.node = expression;
-
-            // This will find whatever expression we need and put it in %r10
-            generate_node(child_target);
-            __access_variable("%rax", identifier->entry, target.function);
-
-            switch (target.node->type) {
-                case ADD_STATEMENT:
-                    puts("\taddq %r10, %rax");
-                    break;
-                case SUBTRACT_STATEMENT:
-                    puts("\tsubq %r10, %rax");
-                    break;
-                case DIVIDE_STATEMENT:
-                    // Extends sign so that it is rdx:rax. This is required by idivq
-                    puts("\tcqto");
-                    puts("\tidivq %r10");
-                    break;
-                case MULTIPLY_STATEMENT:
-                    puts("\timulq %r10");
-                    break;
-            }
-
-            __write_variable("%rax", identifier->entry, target.function);
+            generate_assignment(target);
             return;
         case PRINT_STATEMENT:
-            for (size_t i = 0; i < target.node->n_children; i++) {
-                item = target.node->children[i];
-
-                switch (item->type) {
-                    case STRING_DATA:
-                        printf("\tmovq $.strout, %%rdi\n");
-                        printf("\tmovq $.STR%ld, %%rsi\n", *((size_t *)item->data));
-                        break;
-                    case IDENTIFIER_DATA:
-                        printf("\tmovq $.intout, %%rdi\n");
-                        __access_variable("%rsi", item->entry, target.function);
-                        break;
-                    case EXPRESSION:
-                        child_target.node = item;
-                        child_target.target_destination = "%rsi";
-
-                        generate_node(child_target);
-                        printf("\tmovq $.intout, %%rdi\n");
-                        break;
-                }
-
-                // We align at every print call because expressions etc.
-                // may push variables on the stack, causing an alignment
-                // for this as a whole to not work real well
-                alignment = __align_stack(target.stack_alignment);
-                puts("\tcall printf");
-                __unalign_stack(alignment, target.stack_alignment);
-            }
-
-            // New line
-            printf("\tmovq $.newline, %%rdi\n");
-            alignment = __align_stack(target.stack_alignment);
-            puts("\tcall printf");
-            __unalign_stack(alignment, target.stack_alignment);
+            generate_print_statement(target);
             return;
         case RETURN_STATEMENT:
-            if (target.returned == NULL) {
-                fprintf(stderr, "Return in illegal position inside %s\n", target.function->name);
-                exit(EXIT_FAILURE);
-            }
-
-            *target.returned = true;
-
-            child_target.node = target.node->children[0];
-            child_target.target_destination = "%rax";
-
-            generate_node(child_target);
-            puts("\tleave");
-            puts("\tret");
+            generate_return_statement(target);
             return;
     }
 
@@ -665,6 +750,13 @@ void generate_node(struct compilation_target_t target) {
     if (target.returned != NULL && *target.returned) {
         return;
     }
+
+    struct compilation_target_t child_target = {
+        .function = target.function,
+        .returned = target.returned,
+        .stack_alignment = target.stack_alignment,
+        .label_mangle_index = target.label_mangle_index,
+        .surrounding_loop_label = target.surrounding_loop_label};
 
     node_t *child;
     for (size_t i = 0; i < target.node->n_children; i++) {
@@ -727,9 +819,9 @@ void generate_main(symbol_t *first) {
 
     printf("SKIP_ARGS:\n");
 
-    unsigned int alignment = __align_stack(&stack_alignment);
+    unsigned int alignment = align_stack(&stack_alignment);
     printf("\tcall %s%s\n", FUNC_PREFIX, first->name);
-    __unalign_stack(alignment, &stack_alignment);
+    unalign_stack(alignment, &stack_alignment);
 
     printf("\tjmp\tEND\n");
     printf("ABORT:\n");

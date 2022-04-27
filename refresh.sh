@@ -1,7 +1,5 @@
 make clean
 make
-cd vsl_programs
-make clean
-make
-make ps6-compile
-cd ..
+make -C vsl_programs clean
+make -C vsl_programs
+make -C vsl_programs ps6-compile
