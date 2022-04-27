@@ -439,7 +439,7 @@ static void generate_conditional(struct compilation_target_t target) {
     generate_node(child_target);
     *target.stack_alignment -= 8;
     puts("\tpopq %r10");
-    puts("\tcmp %r11, %r10");
+    puts("\tcmpq %r11, %r10");
 }
 
 static void access_variable(const char *reg, symbol_t *sym, symbol_t *function) {
